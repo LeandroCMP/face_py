@@ -17,6 +17,9 @@ from __future__ import annotations
 
 import pathlib
 import sys
+import threading
+import time
+from collections import deque
 from dataclasses import dataclass
 from typing import Iterable, Sequence
 
@@ -41,6 +44,8 @@ except ImportError as exc:  # pragma: no cover - dependência externa
 
 MODEL_DIR = pathlib.Path("models_insightface")
 MODEL_DIR.mkdir(exist_ok=True)
+
+DEFAULT_TARGET_FPS = 28.0
 
 GENDERS = {0: "Feminino", 1: "Masculino"}
 SKIN_TONE_LABELS = {
@@ -158,6 +163,136 @@ class AttributeSmoother:
             for track in self._tracks
             if self._frame_index - track.last_seen <= self.max_unseen_frames
         ]
+
+
+class PerformanceMonitor:
+    """Mede latência e calcula FPS médio em uma janela deslizante."""
+
+    def __init__(self, max_samples: int = 120) -> None:
+        self._samples = deque(maxlen=max_samples)
+        self._start_time: float | None = None
+
+    def begin(self) -> None:
+        """Marca o início de uma medição."""
+
+        self._start_time = time.perf_counter()
+
+    def end(self) -> float:
+        """Conclui a medição e devolve a latência (em segundos)."""
+
+        if self._start_time is None:
+            return 0.0
+        latency = time.perf_counter() - self._start_time
+        self._samples.append(latency)
+        self._start_time = None
+        return latency
+
+    @property
+    def fps(self) -> float:
+        """Retorna o FPS médio considerando as amostras recentes."""
+
+        if not self._samples:
+            return 0.0
+        avg_latency = float(sum(self._samples) / len(self._samples))
+        return 1.0 / avg_latency if avg_latency > 0.0 else 0.0
+
+    @property
+    def last_latency_ms(self) -> float:
+        """Retorna a última latência registrada em milissegundos."""
+
+        if not self._samples:
+            return 0.0
+        return float(self._samples[-1] * 1000.0)
+
+
+class DynamicResizer:
+    """Ajusta dinamicamente o tamanho de inferência para equilibrar FPS e qualidade."""
+
+    def __init__(
+        self,
+        base_side: int = 960,
+        min_side: int = 640,
+        max_side: int = 1440,
+        target_fps: float = DEFAULT_TARGET_FPS,
+        step: int = 80,
+    ) -> None:
+        self._current_side = base_side
+        self._min_side = min_side
+        self._max_side = max_side
+        self._target_fps = target_fps
+        self._step = step
+        self._last_scale = 1.0
+
+    @property
+    def last_scale(self) -> float:
+        """Escala aplicada na última chamada de resize."""
+
+        return self._last_scale
+
+    def resize(self, frame: np.ndarray) -> tuple[np.ndarray, float]:
+        """Redimensiona o frame respeitando a configuração dinâmica atual."""
+
+        height, width = frame.shape[:2]
+        longest_side = max(height, width)
+        if longest_side <= self._current_side:
+            self._last_scale = 1.0
+            return frame, 1.0
+        scale = self._current_side / float(longest_side)
+        resized = cv2.resize(frame, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+        self._last_scale = scale
+        return resized, scale
+
+    def update(self, latency_seconds: float) -> None:
+        """Atualiza a resolução alvo com base na latência observada."""
+
+        if latency_seconds <= 0.0:
+            return
+        current_fps = 1.0 / latency_seconds
+        if current_fps < self._target_fps * 0.9:
+            self._current_side = max(self._min_side, self._current_side - self._step)
+        elif current_fps > self._target_fps * 1.25 and self._last_scale == 1.0:
+            self._current_side = min(self._max_side, self._current_side + self._step)
+        elif current_fps > self._target_fps * 1.15:
+            self._current_side = min(self._max_side, self._current_side + self._step // 2)
+
+
+class CameraStream:
+    """Captura frames da webcam em uma thread dedicada para reduzir latência."""
+
+    def __init__(self, capture: cv2.VideoCapture) -> None:
+        self._capture = capture
+        self._frame_lock = threading.Lock()
+        self._latest_frame: np.ndarray | None = None
+        self._running = False
+        self._thread: threading.Thread | None = None
+
+    def start(self) -> None:
+        if self._running:
+            return
+        self._running = True
+        self._thread = threading.Thread(target=self._capture_loop, daemon=True)
+        self._thread.start()
+
+    def _capture_loop(self) -> None:
+        while self._running:
+            ret, frame = self._capture.read()
+            if not ret:
+                time.sleep(0.01)
+                continue
+            with self._frame_lock:
+                self._latest_frame = frame
+
+    def read(self) -> np.ndarray | None:
+        with self._frame_lock:
+            if self._latest_frame is None:
+                return None
+            return self._latest_frame.copy()
+
+    def stop(self) -> None:
+        self._running = False
+        if self._thread is not None:
+            self._thread.join(timeout=1.0)
+        self._capture.release()
 
 
 def get_onnx_providers() -> list[str]:
@@ -335,15 +470,19 @@ def analyze_frame(
     frame: np.ndarray,
     analyzer: InsightFaceAnalysis,
     smoother: AttributeSmoother,
-) -> np.ndarray:
-    """Processa um frame e retorna o frame anotado."""
+    resize_policy: DynamicResizer | None = None,
+) -> tuple[np.ndarray, int, float]:
+    """Processa um frame e retorna o frame anotado, número de faces e escala aplicada."""
 
     smoother.begin_frame()
-    processed_frame, scale = resize_for_inference(frame)
+    if resize_policy is None:
+        processed_frame, scale = resize_for_inference(frame)
+    else:
+        processed_frame, scale = resize_policy.resize(frame)
     faces = analyzer.get(processed_frame)
     attribute_model = analyzer.models.get("genderage")
     if attribute_model is None:
-        return frame
+        return frame, 0, scale
 
     cloned_faces = []
     for detected_face in faces:
@@ -370,7 +509,7 @@ def analyze_frame(
         annotate_frame(frame, detection, attributes)
 
     smoother.prune()
-    return frame
+    return frame, len(cloned_faces), scale
 
 
 def open_camera(camera_index: int = 0) -> cv2.VideoCapture:
@@ -382,6 +521,50 @@ def open_camera(camera_index: int = 0) -> cv2.VideoCapture:
             "Não foi possível acessar a webcam. Verifique se ela está conectada e não está em uso por outro aplicativo."
         )
     return capture
+
+
+def configure_capture(capture: cv2.VideoCapture) -> None:
+    """Ajusta parâmetros do dispositivo para reduzir latência e estabilizar FPS."""
+
+    capture.set(cv2.CAP_PROP_FRAME_WIDTH, 960)
+    capture.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+    capture.set(cv2.CAP_PROP_FPS, 30)
+    buffersize_prop = getattr(cv2, "CAP_PROP_BUFFERSIZE", None)
+    if buffersize_prop is not None:
+        capture.set(buffersize_prop, 1)
+    fourcc_prop = getattr(cv2, "CAP_PROP_FOURCC", None)
+    if fourcc_prop is not None:
+        fourcc = cv2.VideoWriter_fourcc(*"MJPG")
+        capture.set(fourcc_prop, fourcc)
+
+
+def overlay_runtime_info(
+    frame: np.ndarray,
+    fps: float,
+    latency_ms: float,
+    face_count: int,
+    scale: float,
+) -> None:
+    """Exibe métricas de desempenho e escala de inferência no frame."""
+
+    info_lines = [
+        f"FPS: {fps:.1f}",
+        f"Latência: {latency_ms:.1f} ms",
+        f"Faces: {face_count}",
+        f"Escala inferência: {scale * 100:.0f}%",
+    ]
+    for idx, text in enumerate(info_lines):
+        y = 20 + idx * 18
+        cv2.putText(
+            frame,
+            text,
+            (10, y),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.5,
+            (255, 255, 255),
+            1,
+            cv2.LINE_AA,
+        )
 
 
 def run(camera_index: int = 0) -> None:
@@ -396,25 +579,46 @@ def run(camera_index: int = 0) -> None:
         print(err)
         return
 
-    capture.set(cv2.CAP_PROP_FRAME_WIDTH, 960)
-    capture.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
-    capture.set(cv2.CAP_PROP_FPS, 30)
+    configure_capture(capture)
+    cv2.setUseOptimized(True)
+
+    stream = CameraStream(capture)
+    stream.start()
+    monitor = PerformanceMonitor()
+    resizer = DynamicResizer()
 
     print('Pressione "q" na janela da webcam para sair.')
-    while True:
-        ret, frame = capture.read()
-        if not ret:
-            print("Falha ao capturar frame da webcam. Encerrando...")
-            break
 
-        analyzed_frame = analyze_frame(frame, analyzer, smoother)
-        cv2.imshow("Análise facial", analyzed_frame)
+    try:
+        while True:
+            frame = stream.read()
+            if frame is None:
+                time.sleep(0.005)
+                continue
 
-        if cv2.waitKey(1) & 0xFF == ord("q"):
-            break
+            monitor.begin()
+            try:
+                analyzed_frame, face_count, scale = analyze_frame(
+                    frame, analyzer, smoother, resizer
+                )
+            finally:
+                latency_seconds = monitor.end()
 
-    capture.release()
-    cv2.destroyAllWindows()
+            resizer.update(latency_seconds)
+            overlay_runtime_info(
+                analyzed_frame,
+                monitor.fps,
+                monitor.last_latency_ms,
+                face_count,
+                scale,
+            )
+            cv2.imshow("Análise facial", analyzed_frame)
+
+            if cv2.waitKey(1) & 0xFF == ord("q"):
+                break
+    finally:
+        stream.stop()
+        cv2.destroyAllWindows()
 
 
 def parse_camera_index(argv: Iterable[str]) -> int:
